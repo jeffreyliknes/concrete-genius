@@ -1,8 +1,13 @@
 import pandas as pd
-import serpapi
+import requests
 import time
 from contacts import companies
 from collections import Counter
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+SERPWOW_API_KEY = os.getenv("SERPWOW_API_KEY")
 
 # --------------------------------------------------------------------------- #
 # 1  Extract keywords from your master company list
@@ -32,23 +37,19 @@ queries = [
     "concrete recycling companies USA"
 ]
 
-# --------------------------------------------------------------------------- #
-# 3  Initialize SerpAPI (insert your real API key here)
-# --------------------------------------------------------------------------- #
-SERPAPI_KEY = 'f5b2b6bb88e241fa85760004556a92fa492298fbfd596a4d0af4441e0462cbf8'
-
 results = []
 
 for query in queries:
     params = {
-        "engine": "google",
+        "api_key": SERPWOW_API_KEY,
         "q": query,
-        "api_key": SERPAPI_KEY,
-        "num": 10
+        "location": "Canada",
+        "num": "10",
+        "output": "json"
     }
 
-    search = serpapi.GoogleSearch(params)
-    data = search.get_dict()
+    response = requests.get("https://api.serpwow.com/live/search", params=params)
+    data = response.json()
 
     for res in data.get("organic_results", []):
         title = res.get("title")

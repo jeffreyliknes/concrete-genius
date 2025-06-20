@@ -3,9 +3,14 @@ signals_agent.py
 Fetches external buying signals (news mentions, RFPs, job postings) for each scored prospect.
 """
 
+import os
+from dotenv import load_dotenv
 import pandas as pd
 import time
-from serpapi import GoogleSearch
+import requests
+
+
+load_dotenv()
 
 INPUT_FILE = "scored_prospects.csv"
 OUTPUT_FILE = "prospects_with_signals.csv"
@@ -14,16 +19,16 @@ OUTPUT_FILE = "prospects_with_signals.csv"
 df = pd.read_csv(INPUT_FILE)
 df = df[df["gpt_score"] == "YES"].reset_index(drop=True)
 
-SERPAPI_KEY = "f5b2b6bb88e241fa85760004556a92fa492298fbfd596a4d0af4441e0462cbf8"
-
-def run_search(query, engine="google", num=5):
-    search = GoogleSearch({
-        "engine": engine,
+def run_search(query, search_type="news", num=5):
+    params = {
+        "api_key": os.getenv("SERPWOW_API_KEY"),
         "q": query,
-        "api_key": SERPAPI_KEY,
-        "num": num
-    })
-    return search.get_dict()
+        "search_type": search_type,
+        "num": num,
+        "output": "json"
+    }
+    response = requests.get("https://api.serpwow.com/search", params=params)
+    return response.json()
 
 news_counts = []
 job_counts = []
@@ -33,13 +38,13 @@ for _, row in df.iterrows():
 
     # News signals
     news_query = f"{name} new plant expansion OR RFP OR bidding"
-    news_data = run_search(news_query, engine="google", num=5)
+    news_data = run_search(news_query, search_type="news", num=5)
     news_results = news_data.get("news_results", [])
     news_counts.append(len(news_results))
     
     # Job signals
     job_query = f"{name} hiring OR \"plant operator\" OR \"operations manager\""
-    job_data = run_search(job_query, engine="google", num=5)
+    job_data = run_search(job_query, search_type="search", num=5)
     job_results = job_data.get("organic_results", [])
     job_counts.append(len(job_results))
     
