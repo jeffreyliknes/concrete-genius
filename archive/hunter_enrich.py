@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 # hunter_enrich.py
-import os, time, sqlite3, csv, argparse
+import os, time, sqlite3, csv, argparse, json, pathlib
 import pandas as pd
 import requests
 from urllib.parse import urlparse
+
+from proxycurl import Proxycurl
+from zerobounce import ZeroBounce
+from hunterio import HunterClient
 
 HUNTER_KEY = os.getenv("HUNTER_API_KEY")
 SLEEP = float(os.getenv("HUNTER_SLEEP_SECONDS", 1))
 MAX_SEARCH = int(os.getenv("HUNTER_MAX_SEARCHES", 25))
 MAX_VERIFY = int(os.getenv("HUNTER_MAX_VERIFICATIONS", 50))
 
-USE_SQLITE = True
-DB_PATH = "leads.db"
-INPUT_CSV = "contacts_clients.csv"        # fallback if not using DB
-OUTPUT_CSV = "emails_enriched.csv"
+# ------------------------------------------------------------------
+# External enrichment clients (Proxycurl → ZeroBounce → Hunter)
+PROXYCURL_KEY = os.getenv("PROXYCURL_KEY")
+ZEROBOUNCE_KEY = os.getenv("ZEROBOUNCE_KEY")
+
+pc = Proxycurl(api_key=PROXYCURL_KEY)
+zb = ZeroBounce(ZEROBOUNCE_KEY)
+hc = HunterClient(HUNTER_KEY)
+
+CACHE_DIR = pathlib.Path("data/cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------------------------
 
 PREFERRED_POSITIONS = ["owner", "ceo", "president", "vp", "operations", "gm", "manager", "sales"]
 
@@ -22,6 +34,40 @@ def domain_from_url(url: str) -> str:
         return ""
     netloc = urlparse(url.strip()).netloc
     return netloc.replace("www.", "").lower()
+
+def enrich_row(row: dict) -> dict:
+    """
+    Apply the stage‑gated enrichment flow to a single prospect dict.
+
+    1. skip if product_fit is False or an email is already present
+    2. pull company data from Proxycurl (cached)
+    3. attempt Hunter domain search for one email, verify via ZeroBounce
+    """
+    if not row.get("product_fit") or row.get("email_final"):
+        return row  # nothing to do
+
+    dom = row["domain"]
+    cache_file = CACHE_DIR / f"{dom}.json"
+    if cache_file.exists():
+        pdata = json.loads(cache_file.read_text())
+    else:
+        pdata = pc.company(domain=dom)
+        cache_file.write_text(json.dumps(pdata))
+        time.sleep(0.35)  # be polite to the API
+
+    # minimal fields we care about
+    row["linkedin_url"] = pdata.get("linkedin", "")
+    row["employee_count"] = pdata.get("employee_count")
+
+    # only now hit Hunter and ZeroBounce
+    emails = hc.domain_search(dom, limit=1)["data"]["emails"]
+    if emails:
+        candidate = emails[0]["value"]
+        if zb.validate(candidate)["status"] in ("valid", "catch-all"):
+            row["email_final"] = candidate
+            row["verification_status"] = "deliverable"
+
+    return row
 
 def pick_best_email(emails):
     # choose best by position/seniority, else first
@@ -101,53 +147,23 @@ def main():
         raise SystemExit("Set HUNTER_API_KEY in .env")
 
     df = load_prospects()
-    domains = df["domain"].drop_duplicates().tolist()
+    rows = df.to_dict(orient="records")
 
-    found_rows = []
-    searched = 0
-    verified = 0
-
-    for d in domains:
-        if searched >= MAX_SEARCH:
-            print("Reached search limit.")
-            break
-        try:
-            data = hunter_domain_search(d)
-            emails = data.get("emails", [])
-            if not emails:
-                print(f"[NO EMAILS] {d}")
-                searched += 1
-                time.sleep(SLEEP)
-                continue
-
-            picked = pick_best_email(emails)
-            if picked:
-                email = picked.get("value")
-                verification_status = ""
-                if email and verified < MAX_VERIFY:
-                    v = hunter_verify(email)
-                    verification_status = v.get("result", "")
-                    verified += 1
-                    time.sleep(SLEEP)
-
-                found_rows.append({
-                    "domain": d,
-                    "email": email,
-                    "first_name": picked.get("first_name"),
-                    "last_name": picked.get("last_name"),
-                    "position": picked.get("position"),
-                    "confidence": picked.get("confidence"),
-                    "verification_status": verification_status,
-                    "raw_json": str(picked)
-                })
-                print(f"[OK] {d} -> {email} ({verification_status})")
-
-            searched += 1
-            time.sleep(SLEEP)
-        except requests.HTTPError as e:
-            print(f"[HTTP {e.response.status_code}] {d}: {e.response.text[:120]}")
-        except Exception as e:
-            print(f"[ERR] {d}: {e}")
+    enriched_rows = [enrich_row(r) for r in rows]
+    found_rows = [
+        {
+            "domain": r["domain"],
+            "email": r.get("email_final"),
+            "first_name": r.get("first_name", ""),
+            "last_name": r.get("last_name", ""),
+            "position": r.get("position", ""),
+            "confidence": r.get("confidence", ""),
+            "verification_status": r.get("verification_status", ""),
+            "raw_json": "",
+        }
+        for r in enriched_rows
+        if r.get("email_final")
+    ]
 
     if not found_rows:
         print("No emails found.")

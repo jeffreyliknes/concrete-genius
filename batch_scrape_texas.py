@@ -5,6 +5,36 @@ import requests
 import pandas as pd
 from sqlalchemy import create_engine
 from datetime import datetime
+import re
+
+
+# ---------------- Product‑fit regex gate ----------------
+_READY_MIX_RX = re.compile(
+    r"(ready[\s\-]?mix(?:ed)?|"                 # ready-mix / readymixed
+    r"ready\s?mix\s?concrete|"                 # “ready mix concrete”
+    r"redi[\s\-]?mix|"                         # redi-mix
+    r"volumetric|volumetric[\s\-]?(mixer|truck)|"  # volumetric mixer / truck
+    r"mobile\s?mix|central[\s\-]?mix|"         # mobile mix, central mix
+    r"batch\s?plant|batching\s?plant|concrete\s?plant|"
+    r"concrete[\s\-]?delivery(?:\sservice)?|"  # concrete delivery / service
+    r"on[\-\s]?site pours)",
+    re.I,
+)
+_NEGATIVE_RX = re.compile(
+    r"(hardware|garden\scenter|roofing|foundation\srepair|asphalt\s+only"
+    r"|homedepot|home\sdepot|lowe'?s|lowes\.com)",
+    re.I,
+)
+
+def passes_product_fit(row) -> bool:
+    """
+    Inspect both the company name and the Apify 'reason'/description field.
+    Returns True when we detect ready‑mix or volumetric language and no
+    blacklist terms.
+    """
+    blob = f"{row['company_name']} {row.get('reason', '')}"
+    return bool(_READY_MIX_RX.search(blob)) and not _NEGATIVE_RX.search(blob)
+# --------------------------------------------------------
 
 TOKEN = os.getenv("APIFY_TOKEN")
 MAPS_ACTOR_ID = os.getenv("APIFY_MAPS_ACTOR_ID")  # e.g. Z1m8HE2JfTNU9ZBfx
@@ -100,8 +130,18 @@ def main():
     )
     df_all = df_all[df_all["url"].notna() & df_all["url"].str.strip().ne("")]
     df_all = df_all.drop_duplicates("url")
+    # flag rows that appear to sell ready‑mix or volumetric concrete
+    df_all["product_fit"] = df_all.apply(passes_product_fit, axis=1)
     df_all["scraped_at"] = datetime.utcnow()
 
+    # ---- ensure the DB schema has the new product_fit column ----
+    def _ensure_product_fit(engine):
+        with engine.begin() as conn:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info('prospects_raw')")]
+            if "product_fit" not in cols:
+                conn.execute("ALTER TABLE prospects_raw ADD COLUMN product_fit INTEGER")
+    _ensure_product_fit(engine)
+    # ----------------------------------------------------------------
     print("Total unique with website:", len(df_all))
     df_all.to_sql("prospects_raw", engine, if_exists="append", index=False)
     print("✅ inserted prospects into DB")
